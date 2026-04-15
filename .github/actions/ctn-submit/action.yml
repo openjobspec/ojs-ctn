@@ -1,0 +1,123 @@
+name: 'OJS CTN Submit'
+description: 'Sign and submit a Conformance Transparency Network (CTN) report from CI.'
+author: 'OpenJobSpec'
+branding:
+  icon: 'check-circle'
+  color: 'green'
+
+inputs:
+  endpoint:
+    description: 'CTN base URL (e.g. https://staging.ctn.openjobspec.org).'
+    required: true
+  key-id:
+    description: 'Submitter key ID (e.g. did:web:example.com:keys:backend-2026).'
+    required: true
+  seed:
+    description: 'Base64-encoded 32-byte ed25519 seed. MUST come from a CI secret.'
+    required: true
+  report:
+    description: 'Path to the SuiteReport JSON file (relative to GITHUB_WORKSPACE).'
+    required: true
+  ctn-submit-version:
+    description: 'Version of ctn-submit to install (git ref). Defaults to the action ref.'
+    required: false
+    default: ''
+  fail-on-error:
+    description: 'If "false", do not fail the job when the submission fails.'
+    required: false
+    default: 'true'
+  go-version:
+    description: 'Go version used to build ctn-submit if a prebuilt binary is unavailable.'
+    required: false
+    default: '1.24'
+
+outputs:
+  entry-id:
+    description: 'CTN entry ID returned by the server on success.'
+    value: ${{ steps.submit.outputs.entry-id }}
+  report-sha256:
+    description: 'sha256 of the canonical report bytes that were signed.'
+    value: ${{ steps.submit.outputs.report-sha256 }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 'Set up Go'
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ inputs.go-version }}
+        cache: false
+
+    - name: 'Install ctn-submit'
+      shell: bash
+      run: |
+        set -euo pipefail
+        ref="${{ inputs.ctn-submit-version }}"
+        if [ -z "$ref" ]; then
+          ref="${GITHUB_ACTION_REF:-main}"
+        fi
+        echo "ojs-ctn ref: $ref"
+        # Build from source against the requested ref. Cached on repeat runs
+        # via the runner's GOCACHE if the runner is reused.
+        tmp="$(mktemp -d)"
+        git clone --depth 1 --branch "$ref" \
+          https://github.com/openjobspec/ojs-ctn.git "$tmp/ojs-ctn" 2>/dev/null \
+          || git clone --depth 1 https://github.com/openjobspec/ojs-ctn.git "$tmp/ojs-ctn"
+        ( cd "$tmp/ojs-ctn" && go build -o "$RUNNER_TEMP/ctn-submit" ./cmd/ctn-submit )
+        echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+    - name: 'Materialize seed'
+      shell: bash
+      env:
+        CTN_SEED_B64: ${{ inputs.seed }}
+      run: |
+        set -euo pipefail
+        if [ -z "${CTN_SEED_B64:-}" ]; then
+          echo "::error::seed input is empty (set it from a secret)" >&2
+          exit 1
+        fi
+        seed_path="$RUNNER_TEMP/ctn-seed.bin"
+        # macOS+linux portable base64 -d.
+        printf '%s' "$CTN_SEED_B64" | base64 -d > "$seed_path" 2>/dev/null \
+          || printf '%s' "$CTN_SEED_B64" | base64 --decode > "$seed_path"
+        actual=$(wc -c < "$seed_path" | tr -d ' ')
+        if [ "$actual" != "32" ]; then
+          echo "::error::decoded seed is $actual bytes, expected 32" >&2
+          exit 1
+        fi
+        chmod 600 "$seed_path"
+        echo "CTN_SEED_PATH=$seed_path" >> "$GITHUB_ENV"
+
+    - name: 'Submit'
+      id: submit
+      shell: bash
+      env:
+        CTN_ENDPOINT: ${{ inputs.endpoint }}
+        CTN_KEY_ID: ${{ inputs.key-id }}
+        CTN_REPORT: ${{ inputs.report }}
+        CTN_FAIL: ${{ inputs.fail-on-error }}
+      run: |
+        set -uo pipefail
+        if [ ! -f "$CTN_REPORT" ]; then
+          echo "::error::report file not found: $CTN_REPORT" >&2
+          exit 1
+        fi
+        out=$("$RUNNER_TEMP/ctn-submit" \
+          -endpoint "$CTN_ENDPOINT" \
+          -key-id   "$CTN_KEY_ID" \
+          -seed-file "$CTN_SEED_PATH" \
+          -report   "$CTN_REPORT" 2>&1) || rc=$?
+        rc="${rc:-0}"
+        echo "$out"
+        if [ "$rc" != "0" ]; then
+          if [ "$CTN_FAIL" = "false" ]; then
+            echo "::warning::ctn-submit failed (fail-on-error=false; not failing the job)" >&2
+            exit 0
+          fi
+          exit "$rc"
+        fi
+        entry_id=$(printf '%s' "$out" | python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print(d.get("entry_id",""))' 2>/dev/null || true)
+        sha=$(printf '%s' "$out" | python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print(d.get("report_sha256",""))' 2>/dev/null || true)
+        echo "entry-id=$entry_id" >> "$GITHUB_OUTPUT"
+        echo "report-sha256=$sha" >> "$GITHUB_OUTPUT"
+        echo "::notice title=CTN submission::entry_id=$entry_id sha256=$sha"

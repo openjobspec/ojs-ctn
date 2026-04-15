@@ -1,0 +1,72 @@
+name: 'OJS CTN Verify'
+description: 'Verify a CTN entry signature against a local trust file in CI.'
+author: 'OpenJobSpec'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  endpoint:
+    description: 'CTN base URL (e.g. https://staging.ctn.openjobspec.org).'
+    required: true
+  entry-id:
+    description: 'Entry ID returned by ctn-submit.'
+    required: true
+  trust-file:
+    description: 'Path to a JSON file mapping key_id -> base64 ed25519 public key.'
+    required: true
+  freshness:
+    description: 'Optional Go-style duration (e.g. "168h"); fail if entry is older.'
+    required: false
+    default: ''
+  ctn-verify-version:
+    description: 'Git ref to build ctn-verify from. Defaults to action ref.'
+    required: false
+    default: ''
+  go-version:
+    description: 'Go toolchain to install.'
+    required: false
+    default: '1.24'
+
+runs:
+  using: 'composite'
+  steps:
+    - uses: actions/setup-go@v5
+      with:
+        go-version: ${{ inputs.go-version }}
+        cache: false
+
+    - name: 'Install ctn-verify'
+      shell: bash
+      run: |
+        set -euo pipefail
+        ref="${{ inputs.ctn-verify-version }}"
+        if [ -z "$ref" ]; then
+          ref="${GITHUB_ACTION_REF:-main}"
+        fi
+        tmp="$(mktemp -d)"
+        git clone --depth 1 --branch "$ref" \
+          https://github.com/openjobspec/ojs-ctn.git "$tmp/ojs-ctn" 2>/dev/null \
+          || git clone --depth 1 https://github.com/openjobspec/ojs-ctn.git "$tmp/ojs-ctn"
+        ( cd "$tmp/ojs-ctn" && go build -o "$RUNNER_TEMP/ctn-verify" ./cmd/ctn-verify )
+        echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+    - name: 'Verify'
+      shell: bash
+      env:
+        CTN_ENDPOINT: ${{ inputs.endpoint }}
+        CTN_ENTRY: ${{ inputs.entry-id }}
+        CTN_TRUST: ${{ inputs.trust-file }}
+        CTN_FRESH: ${{ inputs.freshness }}
+      run: |
+        set -euo pipefail
+        if [ ! -f "$CTN_TRUST" ]; then
+          echo "::error::trust file not found: $CTN_TRUST" >&2
+          exit 1
+        fi
+        args=(-endpoint "$CTN_ENDPOINT" -entry-id "$CTN_ENTRY" -trust-file "$CTN_TRUST")
+        if [ -n "$CTN_FRESH" ]; then
+          args+=(-freshness "$CTN_FRESH")
+        fi
+        "$RUNNER_TEMP/ctn-verify" "${args[@]}"
+        echo "::notice title=CTN verify::entry $CTN_ENTRY verified"

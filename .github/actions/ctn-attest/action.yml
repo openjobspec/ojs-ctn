@@ -1,0 +1,215 @@
+name: 'OJS CTN Attest'
+description: |
+  End-to-end Conformance Trust Network attestation: run the conformance suite,
+  sign the report, submit to the CTN log, and optionally request witness
+  cosignatures. Designed for one-line CI integration.
+author: 'OpenJobSpec'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  server-url:
+    description: 'Base URL of the OJS-conformant backend under test.'
+    required: true
+  ctn-endpoint:
+    description: 'CTN base URL (e.g. https://ctn.openjobspec.org).'
+    required: true
+  key-id:
+    description: 'Submitter key ID (e.g. did:web:example.com:keys:backend-2026).'
+    required: true
+  seed:
+    description: 'Base64-encoded 32-byte ed25519 seed. MUST come from a CI secret.'
+    required: true
+  conformance-level:
+    description: 'Conformance level to test (0-4). Default: 4 (all levels).'
+    required: false
+    default: '4'
+  min-level:
+    description: 'Minimum passing level to accept. Fails the workflow if the backend does not reach this level. Default: 0.'
+    required: false
+    default: '0'
+  suites-dir:
+    description: 'Path to conformance test suite directory.'
+    required: false
+    default: ''
+  witnesses:
+    description: 'Comma-separated witness endpoint URLs to request cosignatures from.'
+    required: false
+    default: ''
+  backend-name:
+    description: 'Human-readable backend name for the report (e.g. ojs-backend-redis).'
+    required: false
+    default: ''
+  fail-on-error:
+    description: 'If "false", do not fail the job when submission fails (conformance failures always fail).'
+    required: false
+    default: 'true'
+  go-version:
+    description: 'Go version for building tools.'
+    required: false
+    default: '1.24'
+
+outputs:
+  entry-id:
+    description: 'CTN entry ID returned by the server on success.'
+    value: ${{ steps.submit.outputs.entry-id }}
+  report-sha256:
+    description: 'SHA-256 of the canonical report bytes that were signed.'
+    value: ${{ steps.submit.outputs.report-sha256 }}
+  conformant-level:
+    description: 'Highest conformance level passed.'
+    value: ${{ steps.conformance.outputs.conformant-level }}
+  conformant:
+    description: 'Whether the backend is conformant at the requested level.'
+    value: ${{ steps.conformance.outputs.conformant }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 'Set up Go'
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ inputs.go-version }}
+        cache: false
+
+    - name: 'Install OJS tools'
+      shell: bash
+      run: |
+        set -euo pipefail
+        ref="${GITHUB_ACTION_REF:-main}"
+        tmp="$(mktemp -d)"
+
+        # Build conformance runner
+        if [ -n "${{ inputs.suites-dir }}" ]; then
+          echo "Using custom suites dir: ${{ inputs.suites-dir }}"
+        else
+          git clone --depth 1 --branch "$ref" \
+            https://github.com/openjobspec/ojs-conformance.git "$tmp/ojs-conformance" 2>/dev/null \
+            || git clone --depth 1 https://github.com/openjobspec/ojs-conformance.git "$tmp/ojs-conformance"
+          ( cd "$tmp/ojs-conformance" && go build -o "$RUNNER_TEMP/ojs-conformance-runner" ./runner/http )
+          echo "SUITES_DIR=$tmp/ojs-conformance/suites" >> "$GITHUB_ENV"
+        fi
+
+        # Build ctn-submit
+        git clone --depth 1 --branch "$ref" \
+          https://github.com/openjobspec/ojs-ctn.git "$tmp/ojs-ctn" 2>/dev/null \
+          || git clone --depth 1 https://github.com/openjobspec/ojs-ctn.git "$tmp/ojs-ctn"
+        ( cd "$tmp/ojs-ctn" && go build -o "$RUNNER_TEMP/ctn-submit" ./cmd/ctn-submit )
+
+        echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+    - name: 'Run conformance suite'
+      id: conformance
+      shell: bash
+      env:
+        OJS_TEST_URL: ${{ inputs.server-url }}
+      run: |
+        set -uo pipefail
+        suites="${{ inputs.suites-dir }}"
+        if [ -z "$suites" ]; then
+          suites="${SUITES_DIR:-./suites}"
+        fi
+        report_path="$RUNNER_TEMP/conformance-report.json"
+
+        "$RUNNER_TEMP/ojs-conformance-runner" \
+          -url "$OJS_TEST_URL" \
+          -suites "$suites" \
+          -level ${{ inputs.conformance-level }} \
+          -output json \
+          -report-file "$report_path" \
+          > "$RUNNER_TEMP/conformance-stdout.json" 2>&1 || true
+
+        echo "REPORT_PATH=$report_path" >> "$GITHUB_ENV"
+
+        # Extract results
+        if [ -f "$report_path" ]; then
+          level=$(python3 -c "import json; d=json.load(open('$report_path')); print(d.get('conformant_level', -1))" 2>/dev/null || echo "-1")
+          conformant=$(python3 -c "import json; d=json.load(open('$report_path')); print(str(d.get('conformant', False)).lower())" 2>/dev/null || echo "false")
+          echo "conformant-level=$level" >> "$GITHUB_OUTPUT"
+          echo "conformant=$conformant" >> "$GITHUB_OUTPUT"
+
+          min_level=${{ inputs.min-level }}
+          if [ "$level" -lt "$min_level" ]; then
+            echo "::error::Conformance level $level is below minimum required level $min_level"
+            exit 1
+          fi
+          echo "::notice title=Conformance::Passed level $level (conformant=$conformant)"
+        else
+          echo "::error::Conformance report not generated"
+          echo "conformant-level=-1" >> "$GITHUB_OUTPUT"
+          echo "conformant=false" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+    - name: 'Materialize seed'
+      shell: bash
+      env:
+        CTN_SEED_B64: ${{ inputs.seed }}
+      run: |
+        set -euo pipefail
+        if [ -z "${CTN_SEED_B64:-}" ]; then
+          echo "::error::seed input is empty (set it from a secret)" >&2
+          exit 1
+        fi
+        seed_path="$RUNNER_TEMP/ctn-seed.bin"
+        printf '%s' "$CTN_SEED_B64" | base64 -d > "$seed_path" 2>/dev/null \
+          || printf '%s' "$CTN_SEED_B64" | base64 --decode > "$seed_path"
+        actual=$(wc -c < "$seed_path" | tr -d ' ')
+        if [ "$actual" != "32" ]; then
+          echo "::error::decoded seed is $actual bytes, expected 32" >&2
+          exit 1
+        fi
+        chmod 600 "$seed_path"
+        echo "CTN_SEED_PATH=$seed_path" >> "$GITHUB_ENV"
+
+    - name: 'Sign and submit to CTN'
+      id: submit
+      shell: bash
+      env:
+        CTN_ENDPOINT: ${{ inputs.ctn-endpoint }}
+        CTN_KEY_ID: ${{ inputs.key-id }}
+        CTN_FAIL: ${{ inputs.fail-on-error }}
+      run: |
+        set -uo pipefail
+        report="$REPORT_PATH"
+        if [ ! -f "$report" ]; then
+          echo "::error::report file not found: $report" >&2
+          exit 1
+        fi
+        out=$("$RUNNER_TEMP/ctn-submit" \
+          -endpoint "$CTN_ENDPOINT" \
+          -key-id   "$CTN_KEY_ID" \
+          -seed-file "$CTN_SEED_PATH" \
+          -report   "$report" 2>&1) || rc=$?
+        rc="${rc:-0}"
+        echo "$out"
+        if [ "$rc" != "0" ]; then
+          if [ "$CTN_FAIL" = "false" ]; then
+            echo "::warning::ctn-submit failed (fail-on-error=false)" >&2
+            exit 0
+          fi
+          exit "$rc"
+        fi
+        entry_id=$(printf '%s' "$out" | python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print(d.get("entry_id",""))' 2>/dev/null || true)
+        sha=$(printf '%s' "$out" | python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print(d.get("report_sha256",""))' 2>/dev/null || true)
+        echo "entry-id=$entry_id" >> "$GITHUB_OUTPUT"
+        echo "report-sha256=$sha" >> "$GITHUB_OUTPUT"
+        echo "::notice title=CTN Attestation::entry_id=$entry_id sha256=$sha"
+
+    - name: 'Post summary'
+      if: always()
+      shell: bash
+      run: |
+        cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+        ## OJS Conformance Attestation
+
+        | Field | Value |
+        |-------|-------|
+        | Backend | \`${{ inputs.backend-name || inputs.server-url }}\` |
+        | Conformance Level | \`${{ steps.conformance.outputs.conformant-level }}\` |
+        | Conformant | \`${{ steps.conformance.outputs.conformant }}\` |
+        | CTN Entry ID | \`${{ steps.submit.outputs.entry-id }}\` |
+        | Report SHA-256 | \`${{ steps.submit.outputs.report-sha256 }}\` |
+
+        EOF
