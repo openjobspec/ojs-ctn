@@ -1,15 +1,19 @@
 // Package sigalg — ML-DSA-65 stub implementation.
 //
+// ⚠️  WARNING: THIS IS NOT A REAL ML-DSA-65 IMPLEMENTATION. ⚠️
+//
 // This file provides Sign and Verify for the ML-DSA-65 algorithm using
-// a deterministic HMAC-SHA-512 based scheme as a placeholder. This
-// allows the full CTN signing and verification pipeline to work
+// a deterministic HMAC-SHA-512 based scheme as a structural placeholder.
+// This allows the full CTN signing and verification pipeline to work
 // end-to-end while the Go ecosystem stabilizes a vetted ML-DSA-65
 // implementation (crypto/mldsa proposal: golang/go#64537, or
 // cloudflare/circl's mldsa65 package).
 //
 // The scheme is: Sign(sk, msg) = HMAC-SHA-512(sk, msg)[:3309 zero-padded]
-// This is NOT post-quantum secure — it is a structural placeholder that
-// exercises the correct key/sig sizes and enables integration testing.
+//
+// This is NOT post-quantum secure. It is NOT cryptographically sound for
+// production use. It is a structural placeholder that exercises the correct
+// key/sig sizes and enables integration testing only.
 //
 // When a real implementation is wired in, swap the Sign/Verify functions
 // and set Implemented=true in the registry.
