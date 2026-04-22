@@ -1,7 +1,6 @@
 package store
 
 import (
-	"encoding/json"
 	"sort"
 )
 
@@ -21,6 +20,12 @@ type ListResult struct {
 
 // List returns a paginated slice of entries, newest first.
 func (s *Store) List(opts ListOptions) ListResult {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.index.list(opts)
+}
+
+func (i *ledgerIndex) list(opts ListOptions) ListResult {
 	if opts.Limit <= 0 {
 		opts.Limit = 50
 	}
@@ -31,29 +36,20 @@ func (s *Store) List(opts ListOptions) ListResult {
 		opts.Offset = 0
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	total := len(s.entries)
+	total := len(i.entries)
 	if opts.Offset >= total {
 		return ListResult{Entries: []Entry{}, Total: total, Offset: opts.Offset, Limit: opts.Limit}
 	}
 
-	// Reverse order (newest first) without modifying s.entries.
+	// Reverse order (newest first) without modifying the append-order index.
 	end := total - opts.Offset
 	start := end - opts.Limit
 	if start < 0 {
 		start = 0
 	}
 	slice := make([]Entry, end-start)
-	for i, j := end-1, 0; i >= start; i-- {
-		e := s.entries[i]
-		if len(e.WitnessCosignatures) > 0 {
-			cs := make([]WitnessCosignature, len(e.WitnessCosignatures))
-			copy(cs, e.WitnessCosignatures)
-			e.WitnessCosignatures = cs
-		}
-		slice[j] = e
+	for position, j := end-1, 0; position >= start; position-- {
+		slice[j] = copyEntry(i.entries[position])
 		j++
 	}
 
@@ -62,13 +58,13 @@ func (s *Store) List(opts ListOptions) ListResult {
 
 // BackendSummary aggregates attestation info for a single backend.
 type BackendSummary struct {
-	BackendName     string `json:"backend_name"`
-	LatestEntryID   string `json:"latest_entry_id"`
-	LatestLevel     int    `json:"latest_level"`
-	LatestConformant bool  `json:"latest_conformant"`
-	LatestRunAt     string `json:"latest_run_at"`
-	TotalRuns       int    `json:"total_runs"`
-	WitnessCount    int    `json:"witness_count"`
+	BackendName      string `json:"backend_name"`
+	LatestEntryID    string `json:"latest_entry_id"`
+	LatestLevel      int    `json:"latest_level"`
+	LatestConformant bool   `json:"latest_conformant"`
+	LatestRunAt      string `json:"latest_run_at"`
+	TotalRuns        int    `json:"total_runs"`
+	WitnessCount     int    `json:"witness_count"`
 }
 
 // ListBackends returns a deduplicated summary of all backends that have
@@ -76,10 +72,14 @@ type BackendSummary struct {
 func (s *Store) ListBackends() []BackendSummary {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.index.listBackends()
+}
 
+func (i *ledgerIndex) listBackends() []BackendSummary {
 	byName := map[string]*BackendSummary{}
-	for i := range s.entries {
-		name := extractBackendName(s.entries[i].Report)
+	for position := range i.entries {
+		report := decodeReportProjection(i.entries[position].Report)
+		name := report.backendName()
 		if name == "" {
 			name = "unknown"
 		}
@@ -90,11 +90,11 @@ func (s *Store) ListBackends() []BackendSummary {
 		}
 		bs.TotalRuns++
 		// Latest = highest sequence number wins (entries are append-order).
-		bs.LatestEntryID = s.entries[i].EntryID
-		bs.LatestRunAt = extractRunAt(s.entries[i].Report)
-		bs.LatestLevel = extractConformantLevel(s.entries[i].Report)
-		bs.LatestConformant = extractConformant(s.entries[i].Report)
-		bs.WitnessCount = len(s.entries[i].WitnessCosignatures)
+		bs.LatestEntryID = i.entries[position].EntryID
+		bs.LatestRunAt = report.runTimestamp()
+		bs.LatestLevel = report.conformanceLevel()
+		bs.LatestConformant = report.isConformant()
+		bs.WitnessCount = len(i.entries[position].WitnessCosignatures)
 	}
 
 	result := make([]BackendSummary, 0, len(byName))
@@ -111,88 +111,19 @@ func (s *Store) ListBackends() []BackendSummary {
 func (s *Store) EntriesForBackend(backendName string) []Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.index.entriesForBackend(backendName)
+}
 
+func (i *ledgerIndex) entriesForBackend(backendName string) []Entry {
 	var result []Entry
-	for i := len(s.entries) - 1; i >= 0; i-- {
-		name := extractBackendName(s.entries[i].Report)
+	for position := len(i.entries) - 1; position >= 0; position-- {
+		name := decodeReportProjection(i.entries[position].Report).backendName()
 		if name == "" {
 			name = "unknown"
 		}
 		if name == backendName {
-			e := s.entries[i]
-			if len(e.WitnessCosignatures) > 0 {
-				cs := make([]WitnessCosignature, len(e.WitnessCosignatures))
-				copy(cs, e.WitnessCosignatures)
-				e.WitnessCosignatures = cs
-			}
-			result = append(result, e)
+			result = append(result, copyEntry(i.entries[position]))
 		}
 	}
 	return result
-}
-
-// extractBackendName pulls the backend name from a report JSON blob.
-// Checks report.backend.name first, then falls back to report.target.
-func extractBackendName(report json.RawMessage) string {
-	var r struct {
-		Backend *struct {
-			Name string `json:"name"`
-		} `json:"backend"`
-		Target string `json:"target"`
-	}
-	if json.Unmarshal(report, &r) != nil {
-		return ""
-	}
-	if r.Backend != nil && r.Backend.Name != "" {
-		return r.Backend.Name
-	}
-	return r.Target
-}
-
-func extractRunAt(report json.RawMessage) string {
-	var r struct {
-		RunAt string `json:"run_at"`
-	}
-	if json.Unmarshal(report, &r) != nil {
-		return ""
-	}
-	return r.RunAt
-}
-
-// ExtractConformantLevel pulls the conformant_level from a report JSON blob.
-func ExtractConformantLevel(report json.RawMessage) int {
-	return extractConformantLevel(report)
-}
-
-// ExtractConformant pulls the conformant flag from a report JSON blob.
-func ExtractConformant(report json.RawMessage) bool {
-	return extractConformant(report)
-}
-
-// ExtractBackendName pulls the backend name from a report JSON blob.
-func ExtractBackendName(report json.RawMessage) string {
-	return extractBackendName(report)
-}
-
-// ExtractRunAt pulls the run_at timestamp from a report JSON blob.
-func ExtractRunAt(report json.RawMessage) string {
-	return extractRunAt(report)
-}
-
-func extractConformantLevel(report json.RawMessage) int {
-	var r struct {
-		ConformantLevel int `json:"conformant_level"`
-	}
-	if json.Unmarshal(report, &r) != nil {
-		return -1
-	}
-	return r.ConformantLevel
-}
-
-func extractConformant(report json.RawMessage) bool {
-	var r struct {
-		Conformant bool `json:"conformant"`
-	}
-	json.Unmarshal(report, &r)
-	return r.Conformant
 }
