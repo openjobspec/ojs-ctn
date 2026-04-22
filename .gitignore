@@ -1,0 +1,10 @@
+/ojs-ctn
+/ctn-audit
+/ctn-rekor-mirror
+/ctn-submit
+/ctn-verify
+/ctn-witness
+/bin/
+/coverage.out
+*.test
+.DS_Store
