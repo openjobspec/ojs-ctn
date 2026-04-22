@@ -1,9 +1,11 @@
 # Changelog
 
-All notable changes to the Conformance Trust Network (CTN) will be documented in this file.
+All notable experimental changes to the Conformance Trust Network (CTN) are
+documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/),
-and this project adheres to [Semantic Versioning](https://semver.org/).
+The format is based on [Keep a Changelog](https://keepachangelog.com/).
+While CTN remains in OJS Labs, there is no supported release line and no
+Semantic Versioning compatibility guarantee.
 
 ## [Unreleased]
 
@@ -17,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Rekor mirror daemon for transparency log bridging
 - P2 registry API with pagination, filtering, and badge generation
 - Witness reputation system with diversity enforcement
-- ML-DSA-65 (PQC) signature support (placeholder implementation)
+- ML-DSA-65 experimental placeholder path (not production cryptography)
 - Revocation and attestation decay lifecycle
 - Prometheus-style metrics counters
 - Comprehensive API documentation and operational runbook
