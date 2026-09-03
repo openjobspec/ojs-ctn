@@ -8,15 +8,12 @@
 package store
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"sync"
 	"time"
 )
@@ -30,13 +27,13 @@ type Submission struct {
 
 // Entry is what the ledger stores and serves.
 type Entry struct {
-	EntryID            string                `json:"entry_id"`
-	LoggedAt           time.Time             `json:"logged_at"`
-	ReportSHA256       string                `json:"report_sha256"`
-	Report             json.RawMessage       `json:"report"`
-	SubmitterSignature string                `json:"submitter_signature"`
-	SubmitterKeyID     string                `json:"submitter_key_id"`
-	SequenceNumber     uint64                `json:"sequence_number"`
+	EntryID             string               `json:"entry_id"`
+	LoggedAt            time.Time            `json:"logged_at"`
+	ReportSHA256        string               `json:"report_sha256"`
+	Report              json.RawMessage      `json:"report"`
+	SubmitterSignature  string               `json:"submitter_signature"`
+	SubmitterKeyID      string               `json:"submitter_key_id"`
+	SequenceNumber      uint64               `json:"sequence_number"`
 	WitnessCosignatures []WitnessCosignature `json:"witness_cosignatures,omitempty"`
 }
 
@@ -46,19 +43,6 @@ type WitnessCosignature struct {
 	WitnessKeyID     string    `json:"witness_key_id"`
 	WitnessSignature string    `json:"witness_signature"`
 	CosignedAt       time.Time `json:"cosigned_at"`
-}
-
-// cosigLine is the wire shape of a cosignature record on disk. We tag
-// it with an outer `cosig` envelope so replay can distinguish entries
-// from cosigs without ambiguity. Existing entry lines are unaffected
-// because they never have a top-level `cosig` field.
-type cosigLine struct {
-	Cosig struct {
-		EntryID          string    `json:"entry_id"`
-		WitnessKeyID     string    `json:"witness_key_id"`
-		WitnessSignature string    `json:"witness_signature"`
-		CosignedAt       time.Time `json:"cosigned_at"`
-	} `json:"cosig"`
 }
 
 // Head describes the current state of the ledger.
@@ -71,50 +55,35 @@ type Head struct {
 
 // Store is the single-writer, multi-reader append-only ledger.
 type Store struct {
-	mu       sync.RWMutex
-	path     string
-	f        *os.File
-	w        *bufio.Writer
-	entries  []Entry          // in-memory mirror; small enough for P1 scale
-	byID     map[string]int   // entry_id -> index in entries
-	headHash string           // sha256 of last entry's JSON line
+	mu    sync.RWMutex
+	log   *appendLog
+	index *ledgerIndex
 }
 
 // Open creates or opens the ledger file at path. The file is created with
 // 0600 perms. Concurrent processes opening the same path produce
 // undefined behavior — single-writer is enforced by convention, not flock.
 func Open(path string) (*Store, error) {
-	// Replay existing entries first.
-	entries, head, err := replay(path)
+	records, err := replayLedger(path)
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	log, err := openAppendLog(path)
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{
-		path:     path,
-		f:        f,
-		w:        bufio.NewWriter(f),
-		entries:  entries,
-		byID:     make(map[string]int, len(entries)),
-		headHash: head,
-	}
-	for i, e := range entries {
-		s.byID[e.EntryID] = i
-	}
-	return s, nil
+	return newStore(log, newLedgerIndex(records)), nil
+}
+
+func newStore(log *appendLog, index *ledgerIndex) *Store {
+	return &Store{log: log, index: index}
 }
 
 // Close flushes and closes the underlying file.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.w != nil {
-		_ = s.w.Flush()
-	}
-	return s.f.Close()
+	return s.log.Close()
 }
 
 // Append writes a new entry. Returns the populated Entry on success.
@@ -142,27 +111,18 @@ func (s *Store) Append(_ context.Context, sub Submission) (*Entry, error) {
 		Report:             sub.Report,
 		SubmitterSignature: sub.SubmitterSignature,
 		SubmitterKeyID:     sub.SubmitterKeyID,
-		SequenceNumber:     uint64(len(s.entries)) + 1,
+		SequenceNumber:     uint64(s.index.count()) + 1,
 	}
 
-	line, err := json.Marshal(&entry)
+	line, lineHash, err := encodeEntry(entry)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.w.Write(append(line, '\n')); err != nil {
-		return nil, err
-	}
-	if err := s.w.Flush(); err != nil {
-		return nil, err
-	}
-	if err := s.f.Sync(); err != nil {
+	if err := s.log.Append(line); err != nil {
 		return nil, err
 	}
 
-	s.entries = append(s.entries, entry)
-	s.byID[entry.EntryID] = len(s.entries) - 1
-	lineHash := sha256.Sum256(line)
-	s.headHash = hex.EncodeToString(lineHash[:])
+	s.index.appendEntry(entry, lineHash)
 
 	return &entry, nil
 }
@@ -171,16 +131,9 @@ func (s *Store) Append(_ context.Context, sub Submission) (*Entry, error) {
 func (s *Store) Get(_ context.Context, entryID string) (*Entry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	idx, ok := s.byID[entryID]
+	e, ok := s.index.get(entryID)
 	if !ok {
 		return nil, fmt.Errorf("entry %q not found", entryID)
-	}
-	e := s.entries[idx]
-	// Defensive copy of cosigs slice so callers can't mutate ours.
-	if len(e.WitnessCosignatures) > 0 {
-		cs := make([]WitnessCosignature, len(e.WitnessCosignatures))
-		copy(cs, e.WitnessCosignatures)
-		e.WitnessCosignatures = cs
 	}
 	return &e, nil
 }
@@ -205,8 +158,7 @@ func (s *Store) Cosign(_ context.Context, entryID, witnessKeyID, witnessSig stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	idx, ok := s.byID[entryID]
-	if !ok {
+	if !s.index.has(entryID) {
 		return nil, fmt.Errorf("cosign: entry %q not found", entryID)
 	}
 
@@ -217,43 +169,15 @@ func (s *Store) Cosign(_ context.Context, entryID, witnessKeyID, witnessSig stri
 		CosignedAt:       now,
 	}
 
-	var line cosigLine
-	line.Cosig.EntryID = entryID
-	line.Cosig.WitnessKeyID = witnessKeyID
-	line.Cosig.WitnessSignature = witnessSig
-	line.Cosig.CosignedAt = now
-
-	bytes, err := json.Marshal(line)
+	line, err := encodeCosignature(entryID, cosig)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.w.Write(append(bytes, '\n')); err != nil {
-		return nil, err
-	}
-	if err := s.w.Flush(); err != nil {
-		return nil, err
-	}
-	if err := s.f.Sync(); err != nil {
+	if err := s.log.Append(line); err != nil {
 		return nil, err
 	}
 
-	// Replace prior cosig from same witness if any.
-	replaced := false
-	for i, c := range s.entries[idx].WitnessCosignatures {
-		if c.WitnessKeyID == witnessKeyID {
-			s.entries[idx].WitnessCosignatures[i] = cosig
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		s.entries[idx].WitnessCosignatures = append(s.entries[idx].WitnessCosignatures, cosig)
-	}
-
-	e := s.entries[idx]
-	cs := make([]WitnessCosignature, len(e.WitnessCosignatures))
-	copy(cs, e.WitnessCosignatures)
-	e.WitnessCosignatures = cs
+	e := s.index.cosign(entryID, cosig)
 	return &e, nil
 }
 
@@ -261,92 +185,14 @@ func (s *Store) Cosign(_ context.Context, entryID, witnessKeyID, witnessSig stri
 func (s *Store) Head(_ context.Context) Head {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	h := Head{
-		SequenceNumber: uint64(len(s.entries)),
-		UpdatedAt:      time.Now().UTC(),
-		LastEntrySHA:   s.headHash,
-	}
-	if len(s.entries) > 0 {
-		h.LastEntryID = s.entries[len(s.entries)-1].EntryID
-	}
-	return h
+	return s.index.head(time.Now().UTC())
 }
 
 // Count returns the number of entries (for diagnostics).
 func (s *Store) Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.entries)
-}
-
-func replay(path string) ([]Entry, string, error) {
-	f, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, "", nil
-	}
-	if err != nil {
-		return nil, "", err
-	}
-	defer f.Close()
-
-	var entries []Entry
-	byID := map[string]int{}
-	var lastHash string
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		// Discriminate: cosignature lines have a top-level "cosig" object.
-		var probe map[string]json.RawMessage
-		if err := json.Unmarshal(line, &probe); err != nil {
-			return nil, "", fmt.Errorf("corrupt ledger line %d: %w", lineNum, err)
-		}
-		if _, isCosig := probe["cosig"]; isCosig {
-			var c cosigLine
-			if err := json.Unmarshal(line, &c); err != nil {
-				return nil, "", fmt.Errorf("corrupt cosig line %d: %w", lineNum, err)
-			}
-			idx, ok := byID[c.Cosig.EntryID]
-			if !ok {
-				// Orphan cosig — log skipped; unlikely outside corruption.
-				continue
-			}
-			cosig := WitnessCosignature{
-				WitnessKeyID:     c.Cosig.WitnessKeyID,
-				WitnessSignature: c.Cosig.WitnessSignature,
-				CosignedAt:       c.Cosig.CosignedAt,
-			}
-			replaced := false
-			for i, prior := range entries[idx].WitnessCosignatures {
-				if prior.WitnessKeyID == cosig.WitnessKeyID {
-					entries[idx].WitnessCosignatures[i] = cosig
-					replaced = true
-					break
-				}
-			}
-			if !replaced {
-				entries[idx].WitnessCosignatures = append(entries[idx].WitnessCosignatures, cosig)
-			}
-			continue
-		}
-		var e Entry
-		if err := json.Unmarshal(line, &e); err != nil {
-			return nil, "", fmt.Errorf("corrupt ledger line %d: %w", lineNum, err)
-		}
-		entries = append(entries, e)
-		byID[e.EntryID] = len(entries) - 1
-		h := sha256.Sum256(append([]byte{}, line...))
-		lastHash = hex.EncodeToString(h[:])
-	}
-	if err := scanner.Err(); err != nil && err != io.EOF {
-		return nil, "", err
-	}
-	return entries, lastHash, nil
+	return s.index.count()
 }
 
 // newEntryID returns a uuidv7-ish identifier. P1 uses a simple

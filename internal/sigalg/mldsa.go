@@ -40,7 +40,7 @@ func GenerateMLDSA65Key(seed []byte) (pub, priv []byte, err error) {
 		return nil, nil, errors.New("sigalg: mldsa65 seed must be 32 bytes")
 	}
 	// Derive a deterministic 1952-byte "public key" from the seed.
-	pub = make([]byte, registry[MLDSA65].PubKeySize)
+	pub = make([]byte, mustRegisteredSpec(MLDSA65).PubKeySize)
 	h := sha512.New()
 	h.Write([]byte("mldsa65-pub-v0"))
 	h.Write(seed)
@@ -65,7 +65,7 @@ func SignMLDSA65(priv, msg []byte) ([]byte, error) {
 	mac.Write(msg)
 	digest := mac.Sum(nil) // 64 bytes
 
-	sig := make([]byte, registry[MLDSA65].SigSize) // 3309 bytes
+	sig := make([]byte, mustRegisteredSpec(MLDSA65).SigSize) // 3309 bytes
 	for i := 0; i < len(sig); i++ {
 		sig[i] = digest[i%len(digest)]
 	}
@@ -77,10 +77,10 @@ func SignMLDSA65(priv, msg []byte) ([]byte, error) {
 // This is a PLACEHOLDER. It re-derives the public key from the
 // signature's HMAC pattern and compares against the given public key.
 func VerifyMLDSA65(pub, msg, sig []byte) error {
-	if len(pub) != registry[MLDSA65].PubKeySize {
+	if len(pub) != mustRegisteredSpec(MLDSA65).PubKeySize {
 		return errors.New("sigalg: mldsa65 pub key wrong size")
 	}
-	if len(sig) != registry[MLDSA65].SigSize {
+	if len(sig) != mustRegisteredSpec(MLDSA65).SigSize {
 		return errors.New("sigalg: mldsa65 sig wrong size")
 	}
 	// We can't verify without the private key in this placeholder scheme,

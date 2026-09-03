@@ -15,50 +15,41 @@ import (
 // Wire layout for keys and signatures uses a 2-byte big-endian
 // length prefix on each component:
 //
-//   pubkey = u16 len_ed | ed25519_pub (32) | u16 len_pq | mldsa_pub (1952)
-//   sig    = u16 len_ed | ed25519_sig (64) | u16 len_pq | mldsa_sig (3309)
+//	pubkey = u16 len_ed | ed25519_pub (32) | u16 len_pq | mldsa_pub (1952)
+//	sig    = u16 len_ed | ed25519_sig (64) | u16 len_pq | mldsa_sig (3309)
 //
 // Length-prefixing (rather than fixed offsets) keeps the format
 // extensible if either component's size changes in a future revision
 // of FIPS 204 or in a new sigalg revision (e.g. Dilithium2/5).
 const HybridEd25519MLDSA65 Algorithm = "hybrid-ed25519-ml-dsa-65"
 
-func init() {
-	specEd := registry[Ed25519]
-	specPQ := registry[MLDSA65]
-	registry[HybridEd25519MLDSA65] = Spec{
-		Algorithm:   HybridEd25519MLDSA65,
-		PubKeySize:  4 + specEd.PubKeySize + specPQ.PubKeySize,
-		SigSize:     4 + specEd.SigSize + specPQ.SigSize,
-		PostQuantum: true,
-		// Marked Implemented=true now that ML-DSA placeholder is wired.
-		Implemented: true,
-	}
-}
-
 // EncodeHybridKey produces the wire form of a hybrid public key from
 // its two constituent components.
 func EncodeHybridKey(edPub, pqPub []byte) ([]byte, error) {
-	if len(edPub) != registry[Ed25519].PubKeySize {
+	edSpec := mustRegisteredSpec(Ed25519)
+	pqSpec := mustRegisteredSpec(MLDSA65)
+	if len(edPub) != edSpec.PubKeySize {
 		return nil, fmt.Errorf("%w: ed25519 pub %d, want %d",
-			ErrSize, len(edPub), registry[Ed25519].PubKeySize)
+			ErrSize, len(edPub), edSpec.PubKeySize)
 	}
-	if len(pqPub) != registry[MLDSA65].PubKeySize {
+	if len(pqPub) != pqSpec.PubKeySize {
 		return nil, fmt.Errorf("%w: ml-dsa-65 pub %d, want %d",
-			ErrSize, len(pqPub), registry[MLDSA65].PubKeySize)
+			ErrSize, len(pqPub), pqSpec.PubKeySize)
 	}
 	return encodeTwoComponents(edPub, pqPub), nil
 }
 
 // EncodeHybridSig produces the wire form of a hybrid signature.
 func EncodeHybridSig(edSig, pqSig []byte) ([]byte, error) {
-	if len(edSig) != registry[Ed25519].SigSize {
+	edSpec := mustRegisteredSpec(Ed25519)
+	pqSpec := mustRegisteredSpec(MLDSA65)
+	if len(edSig) != edSpec.SigSize {
 		return nil, fmt.Errorf("%w: ed25519 sig %d, want %d",
-			ErrSize, len(edSig), registry[Ed25519].SigSize)
+			ErrSize, len(edSig), edSpec.SigSize)
 	}
-	if len(pqSig) != registry[MLDSA65].SigSize {
+	if len(pqSig) != pqSpec.SigSize {
 		return nil, fmt.Errorf("%w: ml-dsa-65 sig %d, want %d",
-			ErrSize, len(pqSig), registry[MLDSA65].SigSize)
+			ErrSize, len(pqSig), pqSpec.SigSize)
 	}
 	return encodeTwoComponents(edSig, pqSig), nil
 }

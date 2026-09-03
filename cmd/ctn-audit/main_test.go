@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -147,5 +148,59 @@ func TestFetchTail_Skips404(t *testing.T) {
 	}
 	if len(out) != 1 || out[0].SequenceNumber != 2 {
 		t.Errorf("expected only seq 2, got %v", out)
+	}
+}
+
+func TestPrintText_Characterization(t *testing.T) {
+	oldest := time.Date(2026, time.August, 1, 10, 0, 0, 0, time.UTC)
+	newest := time.Date(2026, time.August, 2, 11, 30, 0, 0, time.UTC)
+	report := Report{
+		Endpoint:        "https://ctn.example",
+		GeneratedAt:     time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC),
+		HeadSize:        2,
+		HeadSHA256:      "abc123",
+		EntriesAudited:  2,
+		SeqMin:          1,
+		SeqMax:          2,
+		SeqGaps:         []uint64{3},
+		SeqDuplicates:   []uint64{2},
+		OldestEntry:     &oldest,
+		NewestEntry:     &newest,
+		SubmitterCounts: map[string]int{"key": 2},
+		WitnessCoverage: WitnessCoverageSection{
+			AtLeast1:         1,
+			AtLeast2:         1,
+			Coverage1Pct:     0.5,
+			RequiredPct:      0.5,
+			MeetsRequiredPct: true,
+		},
+		Verification: VerificationSection{
+			SignedOK:   1,
+			UnknownKey: 1,
+		},
+		Failures: []EntryFailure{{EntryID: "entry-2", Reason: "bad signature"}},
+		Healthy:  false,
+	}
+
+	var out bytes.Buffer
+	printText(&out, report)
+
+	const want = `CTN Audit Report — https://ctn.example
+  generated_at:   2026-08-02T12:00:00Z
+  head_size:      2
+  head_sha256:    abc123
+  audited:        2 entries (seq 1..2)
+  time window:    2026-08-01T10:00:00Z .. 2026-08-02T11:30:00Z
+  submitters:
+    key                                      2
+  witness coverage: 1 (50.0%) >=1 cosig, 1 >=2 cosigs (required >= 50.0%, MET)
+  verification:   ok=1 unknown_key=1 bad_sig=0 skipped=0
+  seq gaps:       [3]
+  seq duplicates: [2]
+  FAIL entry-2: bad signature
+  healthy: false
+`
+	if out.String() != want {
+		t.Fatalf("text report changed:\n--- got ---\n%s--- want ---\n%s", out.String(), want)
 	}
 }
